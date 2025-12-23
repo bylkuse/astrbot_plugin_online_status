@@ -1,6 +1,7 @@
 进度：骨架 基础概念√
 0.1.0 前不保证配置文件兼容
 
+```
 astrbot_plugin_online_status/
 │
 ├── services/                 # [应用层] 编排业务流程
@@ -27,3 +28,4 @@ astrbot_plugin_online_status/
 │
 ├──_conf_schema.json          # 插件配置模板（含System Prompt模板在内的各种配置项）
 └── main.py                   # →→→插件入口←←← 负责指令路由、依赖注入 (DI)、注册function call
+```
