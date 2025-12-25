@@ -1,12 +1,10 @@
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from ..domain.schemas import OnlineStatus
+from ..domain import OnlineStatus
 
 class BaseStatusAdapter(ABC):
-    """
-    状态设置适配器基类
-    """
+    """状态适配器基类"""
     @abstractmethod
     async def set_custom_status(self, status: OnlineStatus) -> bool:
         """

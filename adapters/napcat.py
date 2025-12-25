@@ -1,164 +1,192 @@
 import asyncio
 import json
-from typing import Optional
+import time
+from typing import Optional, Tuple, Dict, Any
 from astrbot.api import logger
 
-from ..domain import OnlineStatus, StatusType
+from ..domain import OnlineStatus, StatusType, NapcatExt, Retry, Cache, StatusFactory
 from .base import BaseStatusAdapter
 
 class NapcatAdapter(BaseStatusAdapter):
     def __init__(self, client):
-        self.client = client  # Client 实例
-        # 配置重试参数
-        self.MAX_RETRIES = 3      # 最大重试次数
-        self.BASE_DELAY = 2.0     # 初始延迟(秒)
-        self.MAX_DELAY = 10.0     # 最大延迟上限
+        self.client = client
+        self.MAX_RETRIES = Retry.MAX_COUNT
+        self.BASE_DELAY = Retry.BASE_DELAY
+        self.MAX_DELAY = Retry.MAX_DELAY
+
         self._cached_self_id = None
+        self._user_cache = {}
+        self.CACHE_TTL = Cache.USER_STATUS_TTL
 
     def get_platform_name(self) -> str:
-        return "aiocqhttp" # 对应 AstrBot 的 OneBot11 平台名
+        return "aiocqhttp"
+
+    async def _safe_call_api(self, action: str, timeout: float = 5.0, **params) -> Optional[Dict[str, Any]]:
+        """[防腐层] 统一处理网络异常、超时、非标响应"""
+        if not self.client:
+            logger.error(f"[OnlineStatus] ❌ NA: 适配器未连接, 无法调用 {action}")
+            return None
+
+        try:
+            # 1. 超时控制
+            ret = await asyncio.wait_for(
+                self.client.api.call_action(action, **params), 
+                timeout=timeout
+            )
+
+            # 2. 响应清洗
+            if ret is None:
+                logger.warning(f"[OnlineStatus] 🐧 NA: Napcat {action} 返回 None (可能是网络超时)")
+                return None
+
+            if isinstance(ret, dict):
+                return ret
+
+            # 3. 容错
+            if isinstance(ret, str):
+                try:
+                    return json.loads(ret)
+                except json.JSONDecodeError:
+                    return {"status": "unknown", "retcode": -1, "data": ret, "_raw_str": ret}
+
+            logger.warning(f"[OnlineStatus] 🐧 NA: Napcat {action} 返回了未知类型: {type(ret)}")
+            return {"status": "unknown", "retcode": -1, "data": ret}
+
+        except asyncio.TimeoutError:
+            logger.error(f"[OnlineStatus] ❌ NA: Napcat {action} 调用超时 ({timeout}s)")
+            return None
+        except Exception as e:
+            logger.error(f"[OnlineStatus] ❌ NA: Napcat {action} 调用异常: {e}")
+            return None
+
+    # --- 业务逻辑 ---
 
     async def _get_self_id(self) -> Optional[int]:
         if self._cached_self_id:
             return self._cached_self_id
-        try:
-            # 标准 OneBot11 获取登录号接口
-            ret = await self.client.api.call_action("get_login_info")
-            if ret and isinstance(ret, dict):
-                data = ret.get("data", ret)
-                if isinstance(data, dict) and "user_id" in data:
+
+        ret = await self._safe_call_api("get_login_info")
+
+        if ret:
+            data = ret.get("data", ret)
+            if isinstance(data, dict) and "user_id" in data:
+                try:
                     self._cached_self_id = int(data["user_id"])
-                    logger.info(f"[Napcat] 成功获取 Bot Self ID: {self._cached_self_id}")
+                    logger.info(f"[OnlineStatus] 🐧 NA: 成功获取 Bot Self ID: {self._cached_self_id}")
                     return self._cached_self_id
-            logger.warning(f"[Napcat] get_login_info 响应异常: {ret}")
-        except Exception as e:
-            logger.warning(f"[Napcat] 获取自身 ID 异常: {e}")
+                except ValueError:
+                    pass
+
+        logger.warning(f"[OnlineStatus] ❌ NA: 获取自身 ID 失败: {ret}")
         return None
 
-    async def _verify_status_match(self, target_status: OnlineStatus) -> bool:
-        """
-        [内部方法] 回查校验：检查当前 Bot 的实际状态是否与目标状态一致
-        仅用于“标准状态”的校验，自定义状态因涉及 wording 比较较为复杂，暂略
-        """
-        if target_status.type != StatusType.STANDARD:
-            return False
-
-        try:
-            # 1. 获取 Bot 自身 QQ 号 (uin)
-            self_id = await self._get_self_id()
-            if not self_id:
-                logger.warning("[Napcat] 无法获取自身 UIN，跳过回查校验。")
-                return False
-
-            # 2. 查询当前状态
-            # 给一点点延迟，让状态同步到服务器
-            await asyncio.sleep(1.0) 
-            current = await self.get_user_status(self_id)
-            
-            if not current:
-                return False
-
-            # 3. 对比逻辑 (仅对比核心 ID)
-            # 注意：QQ 有时会自动把 battery_status 变动，所以只比对 status 和 ext_status
-            is_match = (
-                current.status == target_status.status and 
-                current.ext_status == target_status.ext_status
-            )
-
-            if is_match:
-                logger.info(f"✅ [回查校验] 验证成功！当前状态已更新为: {current.status}/{current.ext_status}")
-                return True
-            else:
-                logger.warning(
-                    f"[回查校验] 状态不匹配。\n"
-                    f"预期: {target_status.status} (ext: {target_status.ext_status})\n"
-                    f"实际: {current.status} (ext: {current.ext_status})"
-                )
-                return False
-
-        except Exception as e:
-            logger.warning(f"[回查校验] 执行异常: {e}")
-            return False
-
     async def set_custom_status(self, status: OnlineStatus) -> bool:
-        action = status.get_api_endpoint()
-        payload = status.get_payload()
-        
+        action, payload = NapcatSerializer.serialize(status)
+
         attempt = 0
         current_delay = self.BASE_DELAY
 
         while attempt < self.MAX_RETRIES:
-            try:
-                attempt += 1
-                
-                # 1. 发起调用
-                ret = await self.client.api.call_action(action, **payload)
+            attempt += 1
 
-                # ================= DEBUG PROBE START =================
-                log_prefix = f"[DEBUG PROBE][{action}]"
-                try:
-                    ret_dump = json.dumps(ret, ensure_ascii=False, indent=2) if ret is not None else "None"
-                    logger.warning(f"{log_prefix} 响应内容:\n{ret_dump}")
-                except Exception:
-                    logger.warning(f"{log_prefix} 原始响应: {ret}")
-                # ================== DEBUG PROBE END ==================
+            ret = await self._safe_call_api(action, **payload)
+            logger.debug(f"[OnlineStatus] 🐧 NA: Call [{action}] Payload: {payload} | Ret: {str(ret)[:100]}")
 
-                # 2. 判定逻辑 A: 明确成功
-                if ret and isinstance(ret, dict):
-                    if ret.get('status') == 'ok' and ret.get('retcode') == 0:
-                        logger.info(f"✅ 状态同步成功: {status.log_desc}")
-                        return True
-                    else:
-                        logger.warning(f"❌ API 显式拒绝: {ret}")
-                
-                # 3. 判定逻辑 B: 无响应/超时 -> 触发回查校验
-                elif ret is None:
-                    logger.warning(f"⚠️ API 无响应 (None)。尝试执行回查校验...")
-                    
-                    # 仅针对标准状态进行 ID 校验，避免自定义文字匹配的复杂性
-                    if status.type == StatusType.STANDARD:
-                        if await self._verify_status_match(status):
-                            # 校验通过，视为成功，直接返回
-                            return True
-                    else:
-                        logger.warning("当前为自定义状态，暂不支持自动回查校验，将继续重试。")
+            success = False
 
-                # 若代码执行到此，说明 本次尝试失败 且 校验未通过
+            if ret:
+                if ret.get('status') == 'ok' or ret.get('retcode') == 0:
+                    success = True
+                elif isinstance(ret.get('_raw_str'), str):
+                    raw = ret['_raw_str'].lower()
+                    if "success" in raw or "ok" in raw:
+                        success = True
 
-            except Exception as e:
-                logger.error(f"❌ 调用 Napcat 接口异常: {str(e)}")
+            if success:
+                logger.debug(f"[OnlineStatus] ✅ NA: 状态同步成功: {status.log_desc}")
+                return True
 
-            # 4. 重试逻辑
+            logger.warning(f"[OnlineStatus] ❌ NA: 状态同步失败 (尝试 {attempt}/{self.MAX_RETRIES})...")
+
             if attempt < self.MAX_RETRIES:
-                logger.warning(f"[Napcat] 设置未确认，将在 {current_delay}秒 后重试 ({attempt}/{self.MAX_RETRIES})...")
                 await asyncio.sleep(current_delay)
                 current_delay = min(current_delay * 2, self.MAX_DELAY)
             else:
-                logger.error(f"[Napcat] ❌ 达到最大重试次数 ({self.MAX_RETRIES})。")
-                
-                # 最后一次挣扎：如果重试都耗尽了，最后再查一次，万一它是真的慢呢？
-                if ret is None and status.type == StatusType.STANDARD:
-                    logger.warning("[Napcat] 最终回查校验...")
-                    if await self._verify_status_match(status):
-                        return True
-                        
+                # 回查
+                if await self._verify_status_match(status):
+                    logger.info("[OnlineStatus] ✅ NA: 状态同步实际上已生效 (回查通过)")
+                    return True
+
         return False
 
-    async def get_user_status(self, user_id: int) -> Optional[OnlineStatus]:
-        """
-        实现基类方法：获取用户状态
-        """
-        try:
-            ret = await self.client.api.call_action(
-                'nc_get_user_status', 
-                user_id=user_id
-            )
+    async def get_user_status(self, user_id: int, use_cache: bool = True) -> Optional[OnlineStatus]:
+        now = time.time()
 
-            # ret 结构预期: { status: 10, ext_status: 1028, ... }
-            if ret and isinstance(ret, dict):
-                return OnlineStatus.from_napcat_data(ret)
-            
-            return None
+        # 1. 读缓存
+        if use_cache and user_id in self._user_cache:
+            data, expire = self._user_cache[user_id]
+            if now < expire:
+                return data
+            else:
+                del self._user_cache[user_id]
+
+        # 2. 安全 API 调用
+        await asyncio.sleep(0.05) 
+
+        ret = await self._safe_call_api('nc_get_user_status', user_id=user_id)
+
+        if ret and isinstance(ret, dict):
+            data_payload = ret.get("data", ret)
+
+            status_obj = StatusFactory.from_napcat_payload(data_payload)
+
+            self._user_cache[user_id] = (status_obj, now + self.CACHE_TTL)
+            return status_obj
+
+        return None
+
+    async def _verify_status_match(self, target_status: OnlineStatus) -> bool:
+        """回查校验"""
+        try:
+            self_id = await self._get_self_id()
+            if not self_id: return False
+
+            await asyncio.sleep(1.0)
+
+            # 无视缓存
+            current = await self.get_user_status(self_id, use_cache=False)
+            if not current: return False
+
+            # 对比
+            if target_status.type == StatusType.STANDARD:
+                return (current.status == target_status.status and 
+                        current.ext_status == target_status.ext_status)
+
+            elif target_status.type == StatusType.CUSTOM:
+                # 注：Napcat 无法查询到具体的 wording，只能查到 ext_status=2000
+                if current.ext_status == NapcatExt.CUSTOM: 
+                    return True
+
+            return False
         except Exception as e:
-            logger.error(f"获取用户 {user_id} 状态失败: {e}")
-            return None
+            logger.warning(f"[OnlineStatus] ❌ NA: [回查校验] 执行异常: {e}")
+            return False
+
+
+class NapcatSerializer:
+    @staticmethod
+    def serialize(status: OnlineStatus) -> Tuple[str, Dict[str, Any]]:
+        if status.type == StatusType.CUSTOM:
+            payload = {
+                "face_id": status.face_id,
+                "face_type": status.face_type,
+                "wording": status.wording
+            }
+            return 'set_diy_online_status', payload
+        else:
+            payload = {
+                "status": status.status,
+                "ext_status": status.ext_status,
+                "battery_status": status.battery_status
+            }
+            return 'set_online_status', payload

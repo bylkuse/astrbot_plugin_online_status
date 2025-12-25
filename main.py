@@ -1,14 +1,16 @@
 import re
+from typing import Optional
+
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.platform import At
 
-from .utils import PluginConfig
+from .utils import PluginConfig, CustomPresetItem, StatusView
 from .services import StatusManager, ScheduleGenerator, ScheduleResource, ScheduleService
-from .adapters import AstrAdapterManager, AstrHost
-from .domain import OnlineStatus, StatusSource, StatusType
+from .adapters import AstrAdapterManager, AstrHost, NapcatSerializer
+from .domain import StatusSource, Duration, Fallback, QQStatus, NapcatExt, StatusFactory
 
 class OnlineStatusPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -16,455 +18,376 @@ class OnlineStatusPlugin(Star):
         self.config_helper = PluginConfig(config)
         self.data_dir = StarTools.get_data_dir()
 
-        # 初始化各层
+        # 视图层
+        self.view = StatusView(self.config_helper)
+
+        # 宿主
         self.host = AstrHost(context, self.config_helper)
+
+        # 文件 I/O 
         self.resource = ScheduleResource(self.data_dir)
-        self.manager = StatusManager(self.host)
+
+        # 状态机
+        self.manager = StatusManager(self.host, self.config_helper)
+
+        # LLM 交互
         self.generator = ScheduleGenerator(self.host, self.config_helper, self.data_dir)
+
+        # 定时任务
         self.scheduler = ScheduleService(
-            resource=self.resource,   # 传入资源实例
+            resource=self.resource,
             manager=self.manager,
             generator=self.generator,
             config=self.config_helper
         )
+        logger.debug("[OnlineStatus] ⚙对象组装完成 (Stage 1)")
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-        
-        # 1. 启动日程调度器
+        # 启动日程调度器的主循环
         await self.scheduler.start()
-        
-        # 2. 主动绑定 Bot (使用官方 API)
-        try:
-            # 使用官方文档提供的方法获取 Napcat/OneBot11 平台实例
-            platform = self.context.get_platform(filter.PlatformAdapterType.AIOCQHTTP)
-            
-            if platform:
-                # 获取该平台下所有连接的 Bot 实例
-                # platform.insts 是一个字典: {qq_id: client_instance}
-                # 虽然文档提到了 get_client()，但直接读取 insts 可以兼容多账号情况，默认取第一个
-                insts = getattr(platform, "insts", {})
-                
-                if insts:
-                    # 取出第一个在线的 Bot 客户端
-                    bot = list(insts.values())[0]
-                    
-                    # 绑定 Adapter
-                    from .adapters import NapcatAdapter
-                    self.manager.bind_adapter(NapcatAdapter(bot))
-                    
-                    logger.warning(f"[OnlineStatus] 初始化成功: 已绑定 Bot ({getattr(bot, 'uin', 'unknown')})")
-                else:
-                    logger.warning("[OnlineStatus] AIOCQHTTP 平台已加载，但当前没有 Bot 连接。")
-            else:
-                logger.debug("[OnlineStatus] 未检测到 AIOCQHTTP (Napcat) 平台。")
+        logger.debug("[OnlineStatus] 🛎️ 服务已启动，等待平台连接... (Stage 2)")
 
-        except Exception as e:
-            # 捕获异常防止影响插件加载
-            logger.warning(f"[OnlineStatus] 初始化绑定尝试失败: {e}")
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self):
+        logger.debug("[OnlineStatus] 🩺 AstrBot 加载完毕，开始绑定适配器... (Stage 3)")
 
-        logger.info("[OnlineStatus] 插件加载完成。")
+        client = AstrAdapterManager.get_napcat_client(self.context)
 
-    # -----------------------------------------------------------
-    # 事件钩子：LLM 请求前
-    # -----------------------------------------------------------
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE) # 仅监听私聊，底层过滤更高效
+        if client:
+            from .adapters import NapcatAdapter 
+            adapter = NapcatAdapter(client)
+
+            self.manager.bind_adapter(adapter)
+            logger.info(f"[OnlineStatus] ✅ 绑定 Bot: {getattr(client, 'uin', 'unknown')}")
+        else:
+            logger.warning("[OnlineStatus] 🐧 暂未检测到 Napcat (AIOCQHTTP) 客户端连接，日程功能将仅在后台空转")
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
-        """
-        监听私聊消息，用于触发自动唤醒 (Auto Wake-up)
-        """
-        # 1. 严格过滤指令
-        # 凡是以 / 开头的消息被视为指令，不触发唤醒逻辑
-        if event.message_str.strip().startswith("/"):
+        """监听私聊消息触发自动唤醒"""
+        # 过滤私聊指令唤醒
+        global_config = self.context.get_config()
+        raw_prefixes = global_config.get("wake_prefix", ["/"])
+
+        if isinstance(raw_prefixes, str):
+            prefixes = (raw_prefixes,)
+        else:
+            prefixes = tuple(raw_prefixes)
+
+        if event.message_str.strip().startswith(prefixes):
             return
 
-        # 2. 动态绑定 Adapter (确保有发包能力)
+        # 动态维护连接
         adapter = AstrAdapterManager.get_adapter(event)
         if adapter:
-            self.manager.bind_adapter(adapter)
-            
-        # 3. 触发唤醒逻辑
-        # logger.debug(f"[Main] 收到私聊消息: {event.message_str[:10]}... 尝试触发唤醒")
-        await self.manager.trigger_interaction_hook()
+            if not self.manager.adapter or (self.manager.adapter.client != adapter.client):
+                logger.debug("[OnlineStatus] 🔗 检测到活跃连接，更新 Adapter 绑定")
+                self.manager.bind_adapter(adapter)
 
-    # -----------------------------------------------------------
-    # 事件钩子：LLM 请求前处理
-    # -----------------------------------------------------------
+        # 触发业务逻辑
+        current = self.manager._get_current_active_status()
+        if current.source == StatusSource.LLM_TOOL and not current.is_expired:
+            pass
+        else:
+            await self.manager.trigger_interaction_hook()
+
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """
-        处理 Prompt 注入
-        """
+        """提示词注入"""
+        # 1. 适配器检查
+        if not self.manager.adapter:
+            adapter = AstrAdapterManager.get_adapter(event) or self.host.get_napcat_adapter()
+            if adapter: self.manager.bind_adapter(adapter)
+
+        # 2. 自身状态感知
+        current_status = self.manager._get_current_active_status()
+        bg_status = self.manager.get_background_status()
+
+        status_context = self.view.render_self_awareness(current_status, bg_status)
+
+        # 3. 用户状态感知
+        user_context = ""
+        user_id = None
+        if hasattr(event, "message_obj") and hasattr(event.message_obj, "sender"):
+            user_id = getattr(event.message_obj.sender, "user_id", None)
+
+        if user_id and self.manager.adapter:
+            try:
+                target_user_status = await self.manager.adapter.get_user_status(user_id)
+
+                if target_user_status:
+                    if target_user_status.ext_status == NapcatExt.CUSTOM:
+                        logger.debug(f"[OnlineStatus] 🐧 用户 {user_id} 处于自定义状态，跳过上下文注入")
+
+                    elif target_user_status.status == QQStatus.ONLINE and target_user_status.ext_status == NapcatExt.NONE:
+                        pass
+
+                    else:
+                        preset_name = self.config_helper.get_status_name_by_ids(
+                            target_user_status.status, 
+                            target_user_status.ext_status
+                        )
+
+                        if preset_name:
+                            # 匹配预设
+                            user_context = self.view.render_user_awareness(user_id, preset_name)
+                            logger.info(f"[OnlineStatus] 🤔 用户 {user_id} 当前的状态是“{preset_name}")
+                        else:
+                            logger.debug(f"[OnlineStatus] ❓️ 用户 {user_id} 状态 ({target_user_status.status}/{target_user_status.ext_status}) 未定义(也许QQ更新了预设)")
+
+            except Exception as e:
+                logger.warning(f"[OnlineStatus] ❌ 获取用户 {user_id} 状态失败: {e}")
+
+        # 4. 权限与工具指引
         current_p_id = await self.host.get_current_persona_id(event)
         main_p_id = await self.host.get_main_persona_id()
+        is_authorized = (current_p_id == main_p_id)
 
-        if current_p_id == main_p_id:
-            status_list_str = self.config_helper.get_status_list_prompt_str()
-            inject_prompt = (
-                "\n\n[社交状态]\n"
-                "你可以用 `update_qq_status` 工具修改你的 QQ 在线状态显示。\n"
-                "根据时间、情景你可以自主或听取意见修改你的生活安排，\n"
-                "\n"
-                f"可用状态预设列表:\n{status_list_str}\n"
-                "\n"
-                "[操作指南]\n"
-                "- 优先使用列表中的 `status_name`。\n"
-                "- 如果列表中没有合适的，你可以发挥想象力，在 `status_name` 填入 'custom'，并在 `text_wording` 中填入你想要显示的自定义文字（如'正在发呆'），不得超过8个任意字符。"
-            )
-            req.system_prompt += inject_prompt
-        else:
-            deny_prompt = (
-                "\n\n[System Instruction]\n"
-                "Please ignore the tool `update_qq_status`."
-                "You are NOT authorized to verify or change online status."
-            )
-            req.system_prompt += deny_prompt
+        auth_prompt = self.view.render_tool_instruction(is_authorized)
 
-    # -----------------------------------------------------------
-    # LLM 工具定义 (硬隔离 - 权限校验)
-    # -----------------------------------------------------------
+        # 5. 注入
+        req.system_prompt += status_context + user_context + auth_prompt
+
     @filter.llm_tool(name="update_qq_status")
-    async def update_qq_status(self, event: AstrMessageEvent, status_name: str, text_wording: str = ""):
+    async def update_qq_status(
+        self, 
+        event: AstrMessageEvent, 
+        status_name: str, 
+        text_wording: Optional[str] = None,
+        face_name: Optional[str] = None
+    ):
         """
-        更改你的 QQ 在线状态，来表达你的状态、心情或日程变化。
+        更改你的 QQ 在线状态，在社交中展示你的状态、心情、日程等变化
 
         Args:
-            status_name (string): 目标状态名称。请优先从 System Prompt 提供的 [当前可用的预设列表] 中选择（例如 "睡觉中", "忙碌"）。如果想自定义独特状态，请填 "custom"。
-            text_wording (string): [可选] 仅当 status_name 为 "custom" 时填写。你想显示的自定义状态文字（如 "正在修Bug", "发呆中"）。
+            status_name (string): 目标状态名。若要自定义文字，请填"custom"。
+            text_wording (string): [可选] 自定义状态文字(限8字)。
+            face_name (string): [可选] 自定义状态的图标名，仅 text_wording 存在时生效。
         """
-        # 1. 权限校验
+
+        # 权限校验
         current_p_id = await self.host.get_current_persona_id(event)
         main_p_id = await self.host.get_main_persona_id()
 
-        logger.debug(f"[Tool Auth] Current: {repr(current_p_id)} | Main: {repr(main_p_id)}")
-        
         if current_p_id != main_p_id:
-            return "权限拒绝：当前人格无法操作在线状态。"
+            return "静默失败：请保持人设，当前人格无法操作在线状态。"
 
         if not self.manager.adapter:
-            self.manager.bind_adapter(self.host.get_napcat_adapter())
+            client = AstrAdapterManager.get_napcat_client(self.context)
+            if client:
+                from .adapters import NapcatAdapter
+                self.manager.bind_adapter(NapcatAdapter(client))
 
-        # 2. 尝试查找预设 (作为基准配置)
-        # 哪怕 LLM 编了一个不存在的名字，get_preset 返回 None 也不影响后续逻辑
-        preset = self.config_helper.get_preset(status_name)
-        
+        if not self.manager.adapter:
+            return "执行失败：插件尚未绑定到 QQ 后端，无法设置状态。"
+
+        # 逻辑分发
         status_obj = None
 
-        # [逻辑优化] 
-        # 即使 text_wording 存在，我们也可以复用 status_name 对应预设的 face_id 和 is_silent
-        # 这样 LLM 说 "update_qq_status('打游戏', '正在玩黑神话')" 时，能正确用上'打游戏'的图标
-        
         if text_wording:
-            # === 自定义文字模式 ===
-            
-            # A. 确定 Face ID
-            if preset and hasattr(preset, 'face_id'):
-                # 如果预设存在且有 face_id (CustomPreset)，用预设的
-                target_face_id = preset.face_id
-            elif preset and hasattr(preset, 'status_id'):
-                # 如果是标准预设 (StatusPreset)，通常没有 face_id，只能用默认 5
-                target_face_id = 21
-            else:
-                target_face_id = 21
-            
-            # B. 确定 is_silent
-            if preset:
-                target_is_silent = preset.is_silent
-            else:
-                # 没找到预设，默认认为 LLM 设定的状态是"活跃"的 (False)
-                # 除非 LLM 显式说了"睡觉"等词，但这里没法判断，False 是安全的默认值
-                target_is_silent = False
+            # === 自定义 ===
+            target_face_id = Fallback.FACE_ID
+            # 明确指定
+            if face_name:
+                face_preset = self.config_helper.face_presets.get(face_name)
+                if face_preset:
+                    target_face_id = face_preset.face_id
 
-            status_obj = OnlineStatus(
-                type=StatusType.CUSTOM,
-                source=StatusSource.LLM_TOOL,
-                
-                face_id=target_face_id,
-                # face_type 由 schema 自动推导
+            # 容错
+            elif status_name in self.config_helper.face_presets:
+                face_preset = self.config_helper.face_presets.get(status_name)
+                if face_preset:
+                    target_face_id = face_preset.face_id
+
+            # 借图标
+            else:
+                borrow_preset = self.config_helper.get_preset(status_name)
+                if isinstance(borrow_preset, CustomPresetItem):
+                    target_face_id = borrow_preset.face_id
+
+            status_obj = StatusFactory.create_custom(
                 wording=text_wording,
-                
-                is_silent=target_is_silent,
-                
-                # [新增] 设置一个较长的过期时间 (如 2 小时)
-                # 防止 Scheduler 挂了或者长时间没日程变更时，状态永久锁死
-                duration=7200, 
-                created_at=0.0 # 内部会自动设为 time.time()
+                face_id=target_face_id,
+                source=StatusSource.LLM_TOOL,
+                is_silent=False,
+                duration=Duration.LLM_TOOL_SETTING
             )
-            logger.info(f"[LLM] 请求设置自定义文本: {text_wording} (Icon:{target_face_id}, Silent:{target_is_silent})")
+            logger.info(f"[OnlineStatus] 🛠 LLM设置自定义状态: Text='{text_wording}', FaceID={target_face_id}")
 
         else:
-            # === 纯预设模式 ===
+            # === 纯预设 ===
+            preset = self.config_helper.get_preset(status_name)
             if preset:
-                # 预设模式同样给一个默认时长
-                status_obj = OnlineStatus.from_preset(preset, source=StatusSource.LLM_TOOL, duration=7200)
-                logger.info(f"[LLM] 请求切换标准预设: {preset.name}")
-            else:
-                # 预设不存在的兜底
-                status_obj = OnlineStatus(
-                    type=StatusType.STANDARD,
-                    source=StatusSource.LLM_TOOL,
-                    status=10,
-                    ext_status=0,
-                    wording=f"Unknown({status_name})",
-                    duration=7200
+                status_obj = StatusFactory.from_preset(
+                    preset, 
+                    source=StatusSource.LLM_TOOL, 
+                    duration=Duration.LLM_TOOL_SETTING
                 )
+                logger.info(f"[OnlineStatus] 🛠 LLM切换标准预设: {preset.name}")
+            else:
+                # 幻觉兜底
+                status_obj = StatusFactory.create_standard(
+                    status=QQStatus.ONLINE,
+                    ext_status=Fallback.LLM_DEFAULT_EXT,
+                    source=StatusSource.LLM_TOOL,
+                    duration=Duration.LLM_TOOL_SETTING
+                )
+                logger.warning(f"[OnlineStatus] ❓️ LLM请求未知预设 '{status_name}'，已回退")
 
         await self.manager.set_llm_override(status_obj)
-        return f"状态已更新为: {status_name} {text_wording}".strip()
+        return self.view.render_tool_response(status_name, text_wording)
 
     @filter.command_group("os")
     def os_group(self):
         """在线状态管理指令组"""
         pass
-
-    # -----------------------------------------------------------
-    # 子指令: /os adapter
-    # -----------------------------------------------------------
-    @os_group.command("adapter")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def os_adapter(self, event: AstrMessageEvent):
-        """
-        [调试] 手动触发 Napcat 适配器绑定
-        用法: /os adapter
-        """
-        # 复用之前的调试逻辑
-        logger.warning("=== 手动触发绑定调试 (Command: /os adapter) ===")
-        
-        # 调用 Host 尝试获取
-        adapter = self.host.get_napcat_adapter()
-        
-        if adapter:
-            self.manager.bind_adapter(adapter)
-            yield event.plain_result(f"✅ 绑定成功！\nBot对象: {adapter.client}\n状态同步已恢复。")
-        else:
-            yield event.plain_result("❌ 绑定失败。请查看后台控制台的 [DEBUG] 警告日志分析原因。")
-
-    # -----------------------------------------------------------
-    # 子指令: /os query
-    # -----------------------------------------------------------
+ 
     @os_group.command("query")
-    @filter.permission_type(filter.PermissionType.ADMIN)
     async def os_query(self, event: AstrMessageEvent, target: str):
-        """
-        查询用户状态
-        用法: /os query [QQ号/@某人]
-        """
-        # 逻辑复用自原 cmd_os 分支 A
+        """查询用户状态: os query QQ号/@某人"""
         target = target.strip()
         query_user_id = None
-        
-        # 1. 判断是否为纯数字
+
+        # 纯数字
         if re.match(r"^\d+$", target):
             query_user_id = int(target)
-            
-        # 2. 判断是否包含 @ (CQ码解析)
+
+        # @ (CQ码)
         if not query_user_id:
             for component in event.message_obj.message:
                 if isinstance(component, At):
                     query_user_id = component.qq
                     break
-        
+
         if not query_user_id:
-            yield event.plain_result("❌ 请指定有效的 QQ 号或 @某人。")
+            yield event.plain_result("🐧 请指定有效的 QQ 号或 @某人")
             return
 
         adapter = AstrAdapterManager.get_adapter(event)
-        # 如果当前事件没拿到 adapter (例如 HTTP 协议端), 尝试用 Manager 里的缓存
         if not adapter and self.manager.adapter:
             adapter = self.manager.adapter
 
         if not adapter:
-            yield event.plain_result("❌ 无法获取适配器，请先执行 /os adapter 尝试绑定。")
+            yield event.plain_result("❌ 无法获取适配器，使用 os adapter 尝试绑定")
             return
 
         status = await adapter.get_user_status(query_user_id)
         if status:
-            result = (
-                f"用户 {query_user_id} 当前状态:\n"
-                f"----------------\n"
-                f"🏷️ 主状态: {status.status}\n"
-                f"🧩 扩展ID: {status.ext_status}\n"
-            )
-            yield event.plain_result(result)
+            yield event.plain_result(self.view.render_query_result(query_user_id, status))
         else:
-            yield event.plain_result(f"⚠️ 无法获取用户 {query_user_id} 的状态。")
+            yield event.plain_result(f"❓️ 无法获取用户 {query_user_id} 的状态")
 
-    # -----------------------------------------------------------
-    # 子指令: /os set
-    # -----------------------------------------------------------
     @os_group.command("set")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def os_set(self, event: AstrMessageEvent, status_name: str):
-        """
-        强制切换我的状态
-        用法: /os set <预设名>
-        """
+        """设定预设状态: os set <预设名>"""
         status_name = status_name.strip()
-        status_obj = None
+        preset = self.config_helper.get_preset(status_name)
 
-        # 1. 优先匹配自定义预设
-        custom_preset = self.config_helper.custom_presets.get(status_name)
-        if custom_preset:
-            status_obj = OnlineStatus(
-                type=StatusType.CUSTOM,
-                source=StatusSource.LLM_TOOL, # 人工指令等同于 LLM
-                face_id=custom_preset.face_id,
-                face_type=custom_preset.face_type,
-                wording=custom_preset.wording,
-                is_silent=custom_preset.is_silent
-            )
-        else:
-            # 2. 匹配标准预设
-            std_preset = self.config_helper.status_presets.get(status_name)
-            if std_preset:
-                status_obj = OnlineStatus.from_preset(std_preset, source=StatusSource.LLM_TOOL)
-
-        if status_obj:
+        if preset:
+            status_obj = StatusFactory.from_preset(preset, source=StatusSource.LLM_TOOL)
             await self.manager.set_llm_override(status_obj)
-            yield event.plain_result(f"✅ 已强制切换状态为: [{status_name}]")
+            yield event.plain_result(f"✅ 切换状态为: [{status_name}]")
         else:
-            available = ", ".join(list(self.config_helper.status_presets.keys())[:5] + list(self.config_helper.custom_presets.keys())[:5])
-            yield event.plain_result(f"❌ 未知预设名: '{status_name}'。\n可用: {available}...")
-    
-    @os_group.command("message")
+            available = list(self.config_helper.status_presets.keys())[:3]
+            yield event.plain_result(f"❓️ 未知预设名: '{status_name}'。可用: {available}...")
+
+    @os_group.command("custom")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def os_raw_custom(self, event: AstrMessageEvent, face_id: int, wording: str):
+        """设定自定义状态: os custom <face_id> [自定义状态名]"""
+        adapter = self.manager.adapter
+        if not adapter:
+            yield event.plain_result("❌ 失败: 未找到适配器")
+            return
+
+        try:
+            temp_status = StatusFactory.create_custom(
+                wording=wording,
+                face_id=face_id,
+                source=StatusSource.LLM_TOOL
+            )
+
+            action, payload = NapcatSerializer.serialize(temp_status)
+
+            logger.warning(f"======== [RAW TEST] set_diy_online_status ========")
+            logger.warning(f"Auto-Inferred Payload: {payload}")
+
+            ret = await adapter.client.api.call_action(action, **payload)
+
+            yield event.plain_result(f"📤 Payload: {payload}\n📥 Result: {ret}")
+
+        except Exception as e:
+            yield event.plain_result(f"❌ 发生异常: {e}")
+
+    @filter.command_group("osd")
+    def osd_group(self):
+        """在线状态调试指令组"""
+        pass
+
+    @osd_group.command("adapter")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def os_adapter(self, event: AstrMessageEvent):
+        """[调试] 触发 Napcat 适配器绑定: osd adapter"""
+        client = AstrAdapterManager.get_napcat_client(self.context)
+        if client:
+            from .adapters import NapcatAdapter
+            self.manager.bind_adapter(NapcatAdapter(client))
+            yield event.plain_result(f"✅ 绑定到: {client}")
+        else:
+            yield event.plain_result("❌ 未找到 Napcat 客户端实例。")
+
+    @osd_group.command("message")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def os_message(self, event: AstrMessageEvent):
-        """
-        [调试] 模拟收到私聊消息，触发自动唤醒逻辑
-        (不消耗 Token，直接执行 manager.trigger_interaction_hook)
-        用法: /os message
-        """
-        # 1. 尝试确保 Adapter 已绑定
+        """[调试] 模拟私聊消息唤醒: osd message"""
         if not self.manager.adapter:
             adapter = self.host.get_napcat_adapter()
             if adapter:
                 self.manager.bind_adapter(adapter)
-        
-        # 2. 手动触发唤醒钩子
-        logger.info("[Command] 手动触发交互唤醒钩子 (/os message)")
+
         await self.manager.trigger_interaction_hook()
 
-        # 3. 获取触发后的结果状态进行反馈
-        # 给一点点时间让异步任务完成状态切换(虽然后台是await的，但为了保险)
         current = self.manager._get_current_active_status()
-        
-        status_desc = (
-            f"✅ 已模拟消息交互。\n"
-            f"----------------\n"
-            f"当前状态: {current.wording}\n"
-            f"类型: {current.type.name}\n"
-            f"来源: {current.source.name}\n"
-            f"静默: {current.is_silent}"
-        )
-        
-        # 如果是临时状态，显示剩余时间
+
+        # 显示临时状态剩余时间
+        remaining_time = None
         if current.source == StatusSource.INTERACTION and self.manager._temp_status:
-            remain = self.manager._temp_status.remaining_time
-            status_desc += f"\n剩余时间: {remain}s"
-            
-        yield event.plain_result(status_desc)
-    
-    @os_group.command("status")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def os_raw_status(self, event: AstrMessageEvent, status: int, ext_status: int, battery_status: int = 0):
-        """
-        [底层测试] 直接调用 set_online_status
-        用法: /os status <status> <ext_status> <battery_status>
-        示例: /os status 10 1032 0
-        """
-        # 1. 获取连接 (不做任何状态机处理)
-        adapter = self.manager.adapter
-        if not adapter:
-            adapter = self.host.get_napcat_adapter()
-        
-        if not adapter:
-            yield event.plain_result("❌ 失败: 未找到 Napcat 适配器连接")
-            return
+            remaining_time = self.manager._temp_status.remaining_time
 
-        # 2. 构造原始 Payload
-        payload = {
-            "status": status,
-            "ext_status": ext_status,
-            "battery_status": battery_status
-        }
+        result_str = self.view.render_simulation_result(current, remaining_time)
+        yield event.plain_result(result_str)
 
-        # 3. 发送并回显原始结果
-        try:
-            logger.warning(f"======== [RAW TEST] set_online_status ========")
-            logger.warning(f"Payload: {payload}")
-            
-            # 直接调用底层 API
-            ret = await adapter.client.api.call_action("set_online_status", **payload)
-            
-            logger.warning(f"Result: {ret}")
-            yield event.plain_result(f"📤 Payload: {payload}\n📥 Result: {ret}")
-            
-        except Exception as e:
-            logger.error(f"RAW TEST EXCEPTION: {e}")
-            yield event.plain_result(f"❌ 发生异常: {e}")
-
-    @os_group.command("custom")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def os_raw_custom(self, event: AstrMessageEvent, face_id: int, face_type: int, wording: str):
-        """
-        [底层测试] 直接调用 set_diy_online_status
-        用法: /os custom <face_id> <face_type> <wording>
-        示例: /os custom 10 1 测试文本
-        """
-        # 1. 获取连接
-        adapter = self.manager.adapter
-        if not adapter:
-            adapter = self.host.get_napcat_adapter()
-        
-        if not adapter:
-            yield event.plain_result("❌ 失败: 未找到 Napcat 适配器连接")
-            return
-
-        # 2. 构造原始 Payload
-        payload = {
-            "face_id": face_id,
-            "face_type": face_type,
-            "wording": wording
-        }
-
-        # 3. 发送并回显原始结果
-        try:
-            logger.warning(f"======== [RAW TEST] set_diy_online_status ========")
-            logger.warning(f"Payload: {payload}")
-            
-            ret = await adapter.client.api.call_action("set_diy_online_status", **payload)
-            
-            logger.warning(f"Result: {ret}")
-            yield event.plain_result(f"📤 Payload: {payload}\n📥 Result: {ret}")
-            
-        except Exception as e:
-            logger.error(f"RAW TEST EXCEPTION: {e}")
-            yield event.plain_result(f"❌ 发生异常: {e}")
-
-    @os_group.command("persona")
+    @osd_group.command("persona")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def os_persona(self, event: AstrMessageEvent):
-        """
-        [调试] 诊断人格权限 ID
-        用法: /os persona
-        """
+        """[调试] 诊断人格ID & 权限: osd persona"""
         raw_current_id = await self.host.get_current_persona_id(event)
         raw_main_id = await self.host.get_main_persona_id()
-        
-        is_match = (raw_current_id == raw_main_id)
-        
-        result = (
-            f"🕵️‍♂️ 人格权限诊断 (Persona Debug)\n"
-            f"=============================\n"
-            f"🔹 Event.persona_id (当前): {repr(raw_current_id)}\n"
-            f"🔸 Host.main_id     (预设): {repr(raw_main_id)}\n"
-            f"=============================\n"
-            f"⚖️ 匹配结果: {'✅ 通过' if is_match else '❌ 拒绝'}\n"
-        )
-        yield event.plain_result(result)
+
+        result_str = self.view.render_persona_debug(raw_current_id, raw_main_id)
+        yield event.plain_result(result_str)
+
+    @osd_group.command("schedule")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def os_schedule(self, event: AstrMessageEvent):
+        """[调试] 重置为日程状态: osd schedule"""
+        self.manager._manual_status = None
+        self.manager._temp_status = None
+        if self.manager._revert_task:
+            self.manager._revert_task.cancel()
+
+        from datetime import datetime
+        try:
+            now = datetime.now()
+            await self.scheduler._apply_current_slot(now)
+            current = self.manager._get_current_active_status()
+            yield event.plain_result(f"✅ 已重置为日程状态: {current.wording}")
+        except Exception as e:
+            yield event.plain_result(f"❌ 调度异常: {e}")
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
-        # 停止日程调度器，清理后台任务
+        logger.info("[OnlineStatus] 🔌 正在停止插件...")
         await self.scheduler.stop()
-        logger.info("[OnlineStatus] 插件已停止。")
+        self.manager.shutdown()
