@@ -33,6 +33,9 @@ class OnlineStatusPlugin(Star):
         # LLM 交互
         self.generator = ScheduleGenerator(self.host, self.config_helper, self.data_dir)
 
+        # 预处理过滤
+        self.wake_prefixes = self._load_wake_prefixes()
+
         # 定时任务
         self.scheduler = ScheduleService(
             resource=self.resource,
@@ -42,14 +45,28 @@ class OnlineStatusPlugin(Star):
         )
         logger.debug("[OnlineStatus] ⚙对象组装完成 (Stage 1)")
 
+    def _load_wake_prefixes(self) -> tuple:
+        """加载并清洗唤醒前缀"""
+        try:
+            global_config = self.context.get_config()
+            raw_prefixes = global_config.get("wake_prefix", ["/"])
+
+            if isinstance(raw_prefixes, str):
+                return (raw_prefixes,)
+            elif isinstance(raw_prefixes, list):
+                return tuple(raw_prefixes)
+            return ("/",)
+        except Exception:
+            return ("/",)
+
     async def initialize(self):
         # 启动日程调度器的主循环
         await self.scheduler.start()
-        logger.debug("[OnlineStatus] 🛎️ 服务已启动，等待平台连接... (Stage 2)")
+        logger.debug("[OnlineStatus] 🛎️ SS: 服务已启动，等待平台连接... (Stage 2)")
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        logger.debug("[OnlineStatus] 🩺 AstrBot 加载完毕，开始绑定适配器... (Stage 3)")
+        logger.debug("[OnlineStatus] 🩺 NA: AstrBot 加载完毕，开始绑定适配器... (Stage 3)")
 
         client = AstrAdapterManager.get_napcat_client(self.context)
 
@@ -58,30 +75,22 @@ class OnlineStatusPlugin(Star):
             adapter = NapcatAdapter(client)
 
             self.manager.bind_adapter(adapter)
-            logger.info(f"[OnlineStatus] ✅ 绑定 Bot: {getattr(client, 'uin', 'unknown')}")
+            logger.info(f"[OnlineStatus] ✅ NA: 绑定 Bot: {getattr(client, 'uin', 'unknown')}")
         else:
-            logger.warning("[OnlineStatus] 🐧 暂未检测到 Napcat (AIOCQHTTP) 客户端连接，日程功能将仅在后台空转")
+            logger.warning("[OnlineStatus] 🐧 NA: 暂未检测到 Napcat (AIOCQHTTP) 客户端连接，日程功能将仅在后台空转")
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
         """监听私聊消息触发自动唤醒"""
         # 过滤私聊指令唤醒
-        global_config = self.context.get_config()
-        raw_prefixes = global_config.get("wake_prefix", ["/"])
-
-        if isinstance(raw_prefixes, str):
-            prefixes = (raw_prefixes,)
-        else:
-            prefixes = tuple(raw_prefixes)
-
-        if event.message_str.strip().startswith(prefixes):
+        if event.message_str.strip().startswith(self.wake_prefixes):
             return
 
         # 动态维护连接
         adapter = AstrAdapterManager.get_adapter(event)
         if adapter:
             if not self.manager.adapter or (self.manager.adapter.client != adapter.client):
-                logger.debug("[OnlineStatus] 🔗 检测到活跃连接，更新 Adapter 绑定")
+                logger.debug("[OnlineStatus] 🔗 NA: 检测到活跃连接，更新 Adapter 绑定")
                 self.manager.bind_adapter(adapter)
 
         # 触发业务逻辑
@@ -388,6 +397,6 @@ class OnlineStatusPlugin(Star):
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
-        logger.info("[OnlineStatus] 🔌 正在停止插件...")
+        logger.info("[OnlineStatus] 🛑 正在停止插件...再见~")
         await self.scheduler.stop()
         self.manager.shutdown()

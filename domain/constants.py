@@ -56,9 +56,7 @@ class Retry:
     MAX_DELAY = 10.0
 
 class Timing:
-    # API 并发安全缓冲
-    # 如果后端很脆弱，可以适当调大；如果后端强壮，完全可以移除
-    API_CALL_DELAY = 0.05 
+    API_CALL_DELAY = 0.05 # API 并发安全缓冲(视你的服务器性能适当调大或移除)
 
     # 状态同步轮询配置
     SYNC_POLL_TIMEOUT = 3.0    # 最长等待

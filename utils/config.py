@@ -29,7 +29,11 @@ class PluginConfig:
         self.status_presets: Dict[str, StatusPresetItem] = {}
         self.custom_presets: Dict[str, CustomPresetItem] = {}
         self.face_presets: Dict[str, FacePresetItem] = {}
+        self._cached_status_list_str: str = ""
+        self._cached_face_list_str: str = ""
         self._load_all_presets()
+
+        self._precompute_prompt_strings()
 
     def _load_all_presets(self):
         # 1. 加载标准状态
@@ -74,7 +78,20 @@ class PluginConfig:
                 self.face_presets[item.name] = item
             except ValueError: continue
 
-        logger.info(f"[OnlineStatus] 📄 PC: Loaded {len(self.status_presets)} standard, {len(self.custom_presets)} custom, {len(self.face_presets)} face presets.")
+        logger.info(f"[OnlineStatus] 📄 PC: 已加载映射 {len(self.status_presets)} 状态, {len(self.custom_presets)} 自定义, {len(self.face_presets)} 表情")
+
+    def _precompute_prompt_strings(self):
+        """预计算 Prompt 字符串"""
+        # 状态列表
+        lines = ["- " + name for name in self.status_presets.keys()]
+        lines += ["- " + name for name in self.custom_presets.keys()]
+        self._cached_status_list_str = "\n".join(lines)
+
+        # 表情列表
+        all_faces = list(self.face_presets.keys())
+        self._cached_face_list_str = ", ".join(all_faces)
+
+        logger.debug(f"[OnlineStatus] 📄 PC: 提示词预载完成.")
 
     @property
     def main_persona_id(self) -> str:
@@ -104,12 +121,10 @@ class PluginConfig:
     # ---------------------------------------------------------
 
     def get_status_list_prompt_str(self) -> str:
-        lines = ["- " + name for name in self.status_presets.keys()]
-        lines += ["- " + name for name in self.custom_presets.keys()]
-        return "\n".join(lines)
+        return self._cached_status_list_str
 
     def get_face_list_prompt_str(self) -> str:
-        return ", ".join(self.face_presets.keys())
+        return self._cached_face_list_str
 
     def get_preset(self, name: str):
         """查找预设:优先自定义，其次标准预设"""

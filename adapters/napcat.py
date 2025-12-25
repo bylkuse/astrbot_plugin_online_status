@@ -38,7 +38,7 @@ class NapcatAdapter(BaseStatusAdapter):
 
             # 2. 响应清洗
             if ret is None:
-                logger.warning(f"[OnlineStatus] 🐧 NA: Napcat {action} 返回 None (可能是网络超时)")
+                logger.warning(f"[OnlineStatus] 🐧 NA: Napcat {action} 返回 None (载入中/网络超时)")
                 return None
 
             if isinstance(ret, dict):

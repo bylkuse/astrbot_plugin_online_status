@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, date
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 from astrbot.api import logger
 
@@ -19,6 +19,10 @@ class ScheduleService:
         self._running = False
         self._task = None
 
+        self._is_generating = False # 生成状态锁
+        self._generating_date: Optional[date] = None
+        self._bg_tasks: Set[asyncio.Task] = set()
+
     async def start(self):
         if self._running:
             return
@@ -35,12 +39,21 @@ class ScheduleService:
             except asyncio.CancelledError:
                 pass
 
+        # 取消后台生成任务
+        for t in self._bg_tasks:
+            t.cancel()
+        self._bg_tasks.clear()
+        logger.info("[OnlineStatus] 🛑 SS: 调度器及后台任务已停止。")
+
     async def _loop(self):
         while self._running:
             try:
                 now = datetime.now()
-                await self._ensure_daily_schedule(now.date())
+                today = now.date()
+
+                self._trigger_schedule_update(today)
                 await self._apply_current_slot(now)
+
             except Exception as e:
                 logger.error(f"[OnlineStatus] ❌ SS: 日程调度循环发生异常: {e}", exc_info=True)
 
@@ -48,33 +61,57 @@ class ScheduleService:
             wait_seconds = 60 - datetime.now().second
             await asyncio.sleep(wait_seconds)
 
-    async def _ensure_daily_schedule(self, today: date):
-        # 缓存命中
+    def _trigger_schedule_update(self, today: date):
+        """后台:数据更新"""
         if self.loaded_date == today and self.current_schedule:
             return
 
-        # 加载
-        local_data = await self.resource.load_schedule(today)
-        
-        if local_data:
-            self.current_schedule = local_data
-            self.loaded_date = today
-            logger.info(f"[OnlineStatus] ✅ SS: 已加载本地日程表 ({today})")
+        if self._is_generating and self._generating_date == today:
             return
 
-        # 生成
-        logger.info("[OnlineStatus] 📅 SS: 未找到今日日程，正在请求 LLM 生成...")
-        new_schedule = await self.generator.generate_daily_schedule(today)
+        logger.info(f"[OnlineStatus] 📅 SS: 检测到日程数据需要更新 ({today})，启动后台任务...")
+        self._is_generating = True
+        self._generating_date = today
 
-        if new_schedule:
-            self.current_schedule = new_schedule
-            self.loaded_date = today
+        task = asyncio.create_task(self._background_load_or_generate(today))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard) # 任务完成后自动从集合移除
 
-            # 保存
-            if await self.resource.save_schedule(today, new_schedule):
-                logger.info(f"[OnlineStatus] ✅ SS: 新日程已生成并保存: {len(new_schedule)} 个时间段")
-        else:
-            logger.warning("[OnlineStatus] ❌ SS: 日程生成失败，将在下一周期重试。")
+    async def _background_load_or_generate(self, target_date: date):
+        """后台:IO操作"""
+        try:
+            # 加载 (快)
+            local_data = await self.resource.load_schedule(target_date)
+
+            if local_data:
+                self.current_schedule = local_data
+                self.loaded_date = target_date
+                logger.info(f"[OnlineStatus] 📅 SS: (后台) 已加载本地日程表 ({target_date})")
+                return
+
+            # LLM 生成 (慢)
+            logger.info(f"[OnlineStatus] 📅 SS: (后台) 本地无数据，正在请求 LLM 生成 {target_date} 日程...")
+            new_schedule = await self.generator.generate_daily_schedule(target_date)
+
+            if new_schedule:
+                self.current_schedule = new_schedule
+                self.loaded_date = target_date
+
+                if await self.resource.save_schedule(target_date, new_schedule):
+                    logger.info(f"[OnlineStatus] ✅ SS: (后台) 新日程已生成并保存: {len(new_schedule)} 个时间段")
+            else:
+                logger.warning("[OnlineStatus] 📅 SS: (后台) 日程生成失败。")
+
+        except asyncio.CancelledError:
+            logger.info(f"[OnlineStatus] ⚠️ SS: (后台) 任务被取消 (Plugin Reload/Stop)")
+            raise # task 标记 Cancelled
+
+        except Exception as e:
+            logger.error(f"[OnlineStatus] ❌ SS: (后台) 日程加载任务异常: {e}", exc_info=True)
+
+        finally:
+            self._is_generating = False
+            self._generating_date = None
 
     def _normalize_time_str(self, t_str: str) -> str:
         """标准化为HH:MM"""
@@ -113,7 +150,7 @@ class ScheduleService:
             )
 
         # 白天
-        logger.info(f"[OnlineStatus] 🌞 SS: 白天时段({hour}点)兜底")
+        logger.debug(f"[OnlineStatus] 🌞 SS: 白天时段({hour}点)兜底")
         return StatusFactory.create_standard(
             status=QQStatus.ONLINE, 
             ext_status=Fallback.SCHEDULER_DEFAULT_EXT, 
@@ -181,7 +218,7 @@ class ScheduleService:
 
         # [兜底]时段感知
         if not status_obj:
-            logger.warning(f"[OnlineStatus] 🥴 SS: !!!触发时段兜底，生成的日程可能不完整!!!")
+            logger.info(f"[OnlineStatus] 🥴 SS: 触发时段兜底，生成的日程可能不完整!")
             status_obj = self._get_gap_fallback_status(now)
 
         await self.manager.update_schedule(status_obj)

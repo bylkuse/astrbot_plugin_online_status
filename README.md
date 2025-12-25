@@ -5,7 +5,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-purple?style=flat-square)](https://github.com/Soulter/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](./LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.0.3-orange?style=flat-square)]()
+[![Version](https://img.shields.io/badge/Version-0.0.4-orange?style=flat-square)]()
 
 ** 让闲置的状态显示发挥它应有的作用 **
 <br>
@@ -25,6 +25,9 @@
 * 配置-状态时长（针对预设或随机）
 * 指令-日程管理
 * 指令-预设管理
+* 功能-电量变化
+* 功能-输入状态
+* 功能-节假日感知
 * 正式的说明文档
 
 ## 🧱 依赖
