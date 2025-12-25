@@ -77,7 +77,7 @@ class AstrHost:
                 all_personas = await self.context.persona_manager.get_all_personas()
                 if all_personas:
                     return all_personas[0].id
-            except:
+            except Exception:
                 pass
             return "unknown"
 

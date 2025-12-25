@@ -1,7 +1,7 @@
 name: astrbot_plugin_online_status
 display_name: 在线状态
 desc: 在线状态管理与感知（适配Napcat）
-version: v0.0.2
+version: v0.0.3
 author: bylkuse
 repo: https://github.com/bylkuse/astrbot_plugin_online_status
 

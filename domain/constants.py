@@ -55,5 +55,14 @@ class Retry:
     BASE_DELAY = 2.0
     MAX_DELAY = 10.0
 
+class Timing:
+    # API 并发安全缓冲
+    # 如果后端很脆弱，可以适当调大；如果后端强壮，完全可以移除
+    API_CALL_DELAY = 0.05 
+
+    # 状态同步轮询配置
+    SYNC_POLL_TIMEOUT = 3.0    # 最长等待
+    SYNC_POLL_INTERVAL = 0.5   # 每几秒检查一次
+
 class Cache:
     USER_STATUS_TTL = 180      # 缓存用户状态时长

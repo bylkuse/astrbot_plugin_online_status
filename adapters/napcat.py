@@ -4,7 +4,7 @@ import time
 from typing import Optional, Tuple, Dict, Any
 from astrbot.api import logger
 
-from ..domain import OnlineStatus, StatusType, NapcatExt, Retry, Cache, StatusFactory
+from ..domain import OnlineStatus, StatusType, NapcatExt, Retry, Timing, Cache, StatusFactory
 from .base import BaseStatusAdapter
 
 class NapcatAdapter(BaseStatusAdapter):
@@ -17,6 +17,8 @@ class NapcatAdapter(BaseStatusAdapter):
         self._cached_self_id = None
         self._user_cache = {}
         self.CACHE_TTL = Cache.USER_STATUS_TTL
+
+        self._api_semaphore = asyncio.Semaphore(10)
 
     def get_platform_name(self) -> str:
         return "aiocqhttp"
@@ -130,16 +132,17 @@ class NapcatAdapter(BaseStatusAdapter):
             else:
                 del self._user_cache[user_id]
 
-        # 2. 安全 API 调用
-        await asyncio.sleep(0.05) 
-
-        ret = await self._safe_call_api('nc_get_user_status', user_id=user_id)
+        try:
+            # 限制并发 API 调用数量
+            async with self._api_semaphore:
+                ret = await self._safe_call_api('nc_get_user_status', user_id=user_id)
+        except Exception as e:
+            logger.error(f"[OnlineStatus] ❌ NA: API 并发限制或调用异常: {e}")
+            return None
 
         if ret and isinstance(ret, dict):
             data_payload = ret.get("data", ret)
-
             status_obj = StatusFactory.from_napcat_payload(data_payload)
-
             self._user_cache[user_id] = (status_obj, now + self.CACHE_TTL)
             return status_obj
 
@@ -151,23 +154,35 @@ class NapcatAdapter(BaseStatusAdapter):
             self_id = await self._get_self_id()
             if not self_id: return False
 
-            await asyncio.sleep(1.0)
+            start_time = time.time()
 
-            # 无视缓存
-            current = await self.get_user_status(self_id, use_cache=False)
-            if not current: return False
+            # 循环检查到超时
+            while (time.time() - start_time) < Timing.SYNC_POLL_TIMEOUT:
+                # 等待间隔
+                await asyncio.sleep(Timing.SYNC_POLL_INTERVAL)
 
-            # 对比
-            if target_status.type == StatusType.STANDARD:
-                return (current.status == target_status.status and 
-                        current.ext_status == target_status.ext_status)
+                # 无视缓存，强制查询
+                current = await self.get_user_status(self_id, use_cache=False)
+                if not current: 
+                    continue
 
-            elif target_status.type == StatusType.CUSTOM:
-                # 注：Napcat 无法查询到具体的 wording，只能查到 ext_status=2000
-                if current.ext_status == NapcatExt.CUSTOM: 
+                # 比对
+                is_match = False
+                if target_status.type == StatusType.STANDARD:
+                    is_match = (current.status == target_status.status and 
+                                current.ext_status == target_status.ext_status)
+
+                elif target_status.type == StatusType.CUSTOM:
+                    # 对于自定状态只能查到 ext_status 为 2000
+                    if current.ext_status == NapcatExt.CUSTOM: 
+                        is_match = True
+
+                if is_match:
                     return True
 
+            logger.warning(f"[OnlineStatus] 🐧 NA: 状态同步验证超时 ({Timing.SYNC_POLL_TIMEOUT}s)")
             return False
+
         except Exception as e:
             logger.warning(f"[OnlineStatus] ❌ NA: [回查校验] 执行异常: {e}")
             return False

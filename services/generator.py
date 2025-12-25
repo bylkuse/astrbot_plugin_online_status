@@ -1,10 +1,10 @@
 import json
 import re
-import os
 import time
 import asyncio
 from datetime import date
-from typing import List, Dict
+from typing import List, Dict, Union
+from pathlib import Path
 
 from pydantic import ValidationError
 from astrbot.api import logger
@@ -14,10 +14,10 @@ from ..utils import PluginConfig
 from ..domain import ScheduleItem
 
 class ScheduleGenerator:
-    def __init__(self, host: AstrHost, config: PluginConfig, data_dir: str):
+    def __init__(self, host: AstrHost, config: PluginConfig, data_dir: Union[str, Path]):
         self.host = host
         self.config = config
-        self.data_dir = data_dir
+        self.data_dir = Path(data_dir)
 
     async def generate_daily_schedule(self, target_date: date) -> List[Dict]:
         """生成日程表"""
@@ -120,13 +120,19 @@ class ScheduleGenerator:
         def _write():
             timestamp = int(time.time())
             filename = f"error_llm_json_{target_date}_{timestamp}.txt"
-            filepath = os.path.join(self.data_dir, filename)
+            filepath = self.data_dir / filename
+
+            content = (
+                "=== LLM Raw Response ===\n"
+                f"{str(raw_text)}\n\n"
+                "=== Error Details ===\n"
+                f"{str(error)}"
+            )
+
             try:
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write("=== LLM Raw Response ===\n")
-                    f.write(str(raw_text))
-                    f.write(f"\n\n=== Error Details ===\n{str(error)}")
-            except:
-                pass
+                filepath.write_text(content, encoding='utf-8')
+
+            except Exception as e:
+                logger.error(f"[OnlineStatus] ❌ SG: 无法写入调试日志文件 [{filepath}]: {e}")
 
         asyncio.get_running_loop().run_in_executor(None, _write)
