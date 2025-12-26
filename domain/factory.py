@@ -1,3 +1,4 @@
+import time
 from typing import Optional, Dict, Any
 
 from ..utils import StatusPresetItem, CustomPresetItem
@@ -35,7 +36,8 @@ class StatusFactory:
             is_silent=is_silent,
             duration=duration,
             status=QQStatus.ONLINE,
-            ext_status=NapcatExt.NONE
+            ext_status=NapcatExt.NONE,
+            created_at=time.time()
         )
 
     @staticmethod
@@ -55,7 +57,8 @@ class StatusFactory:
             is_silent=is_silent,
             duration=duration,
             face_type=FaceType.SYSTEM,
-            wording=""
+            wording="",
+            created_at=time.time()
         )
 
     @staticmethod
@@ -99,6 +102,8 @@ class StatusFactory:
         status_val = int(data.get("status", QQStatus.ONLINE))
         ext_val = int(data.get("ext_status", NapcatExt.NONE))
 
+        now = time.time()
+
         if ext_val == NapcatExt.CUSTOM:
             return OnlineStatus(
                 type=StatusType.CUSTOM,
@@ -107,7 +112,8 @@ class StatusFactory:
                 wording="<Remote Custom>", # 占位
                 status=status_val,
                 ext_status=ext_val,
-                is_silent=False
+                is_silent=False,
+                created_at=now
             )
         else:
             return OnlineStatus(
@@ -115,7 +121,8 @@ class StatusFactory:
                 source=StatusSource.INTERACTION,
                 status=status_val,
                 ext_status=ext_val,
-                is_silent=False
+                is_silent=False,
+                created_at=now
             )
 
     # --- 内部方法 ---
