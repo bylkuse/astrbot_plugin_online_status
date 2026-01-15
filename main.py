@@ -12,6 +12,11 @@ from .services import StatusManager, ScheduleGenerator, ScheduleResource, Schedu
 from .adapters import AstrAdapterManager, AstrHost, NapcatSerializer
 from .domain import StatusSource, Duration, Fallback, QQStatus, NapcatExt, StatusFactory
 
+try:
+    apply_gemini_patch()
+except Exception as e:
+    logger.warning(f"[OnlineStatus] 补丁加载失败: {e}") # MonkeyPatch 应付部分中转站兼容性问题
+
 class OnlineStatusPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)

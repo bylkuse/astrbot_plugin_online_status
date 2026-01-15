@@ -1,9 +1,69 @@
 from typing import Optional, Any
+
 from astrbot.api import logger
 from astrbot.api.star import Context
 from astrbot.api.event import filter
+from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 
 from . import NapcatAdapter
+
+
+_original_query = ProviderOpenAIOfficial._query
+
+def _fix_gemini_payload(payloads: dict):
+    """
+    [Monkey Patch] 修复 部分 API中转 协议兼容性问题。
+    Gemini API 强制要求 role='tool' 的消息必须包含 name 字段，
+    但在某些情况下未传递该字段。
+    """
+    try:
+        messages = payloads.get("messages", [])
+        if not messages:
+            return
+
+        # 1. 建立索引：tool_call_id -> function_name
+        id_to_name_map = {}
+
+        for msg in messages:
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                tool_calls = msg["tool_calls"]
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        if isinstance(tc, dict):
+                            t_id = tc.get("id")
+                            func = tc.get("function", {})
+                            t_name = func.get("name")
+                            if t_id and t_name:
+                                id_to_name_map[t_id] = t_name
+
+        # 2. 修复数据：给 role='tool' 且缺 name 的消息补全字段
+        for msg in messages:
+            if msg.get("role") == "tool":
+                if "name" not in msg or not msg["name"]:
+                    tool_call_id = msg.get("tool_call_id")
+
+                    # 尝试找回名字，找不到则使用默认值
+                    found_name = id_to_name_map.get(tool_call_id)
+                    final_name = found_name if found_name else "unknown_tool"
+
+                    msg["name"] = final_name
+                    logger.debug(f"[OnlineStatus] 🩹 Patch: 已为 tool_call_id={tool_call_id} 补全 name='{final_name}'")
+
+    except Exception as e:
+        logger.warning(f"[OnlineStatus] 🩹 Patch Warning: 修复过程异常: {e}")
+
+async def _patched_query(self, payloads: dict, tools=None):
+    # 发送前修复 payload
+    _fix_gemini_payload(payloads)
+    # 继续原始流程
+    return await _original_query(self, payloads, tools)
+
+def apply_gemini_patch():
+    """激活 Gemini 兼容性补丁"""
+    if ProviderOpenAIOfficial._query != _patched_query:
+        ProviderOpenAIOfficial._query = _patched_query
+        logger.info("[OnlineStatus] 🛡️ AstrBot Provider 兼容性补丁已激活 (in astr.py)")
+
 
 class AstrAdapterManager:
     @staticmethod
